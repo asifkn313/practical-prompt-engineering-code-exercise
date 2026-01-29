@@ -1,75 +1,139 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Prompt Library</title>
+  <title>✏️ Prompt Library</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
+
 <body>
   <header class="app-header">
-    <h1>Prompt Library</h1>
-    <div class="header-tools" role="region" aria-label="Data tools">
-      <button type="button" id="export-btn" class="tool-btn" aria-label="Export prompts">Export</button>
-      <button type="button" id="import-btn" class="tool-btn" aria-label="Import prompts">Import</button>
-      <input type="file" id="import-file" accept="application/json" hidden aria-hidden="true" />
+    <div class="header-content">
+      <div class="header-branding">
+        <h1>✏️ Prompt Library</h1>
+        <p class="header-subtitle">Store, preview & iterate on your AI prompts locally</p>
+      </div>
+      <div class="header-tools" role="region" aria-label="Data tools">
+        <button type="button" id="export-btn" class="tool-btn" aria-label="Export prompts">
+          EXPORT
+        </button>
+        <button type="button" id="import-btn" class="tool-btn" aria-label="Import prompts">
+          IMPORT
+        </button>
+        <input type="file" id="import-file" accept="application/json" hidden aria-hidden="true" />
+      </div>
     </div>
   </header>
 
   <main class="layout">
-    <section class="panel" aria-labelledby="form-heading">
-      <h2 id="form-heading" class="panel-title">Add Prompt</h2>
+    <section class="panel panel-form" aria-labelledby="form-heading">
+      <h2 id="form-heading" class="panel-title">
+        <span id="form-mode-label">ADD A PROMPT</span>
+      </h2>
+
       <form id="prompt-form" novalidate>
+        <input type="hidden" id="edit-id" value="" />
+
         <div class="field-group">
-          <label for="prompt-title">Title</label>
-          <input type="text" id="prompt-title" name="title" placeholder="e.g. Blog Idea Generator" maxlength="120" required />
-          <p class="field-hint" id="title-hint">Required. Max 120 characters.</p>
+          <label for="prompt-title">TITLE <span class="required">*</span></label>
+          <input type="text" id="prompt-title" name="title" placeholder="e.g. Blog Outline Generator" maxlength="120"
+            required />
         </div>
+
         <div class="field-group">
-          <label for="model-name">Model</label>
+          <label for="model-name">MODEL <span class="required">*</span></label>
           <input type="text" id="model-name" name="model" placeholder="e.g. gpt-4o-mini" maxlength="100" required />
-          <p class="field-hint" id="model-hint">Required. Model identifier (max 100 chars).</p>
         </div>
+
         <div class="field-group">
-          <label for="prompt-content">Content</label>
-          <textarea id="prompt-content" name="content" placeholder="Enter the full prompt here..." rows="6" required></textarea>
-          <p class="field-hint" id="content-hint">Required.</p>
+          <label for="prompt-content">PROMPT CONTENT <span class="required">*</span></label>
+          <textarea id="prompt-content" name="content" placeholder="Write the full prompt here..." rows="8"
+            required></textarea>
         </div>
+
         <div class="actions">
-          <button type="submit" id="save-btn">Save Prompt</button>
+          <button type="submit" id="save-btn" class="primary-btn">
+            <span id="save-btn-text">SAVE PROMPT</span>
+          </button>
+          <button type="button" id="clear-btn" class="secondary-btn">CLEAR</button>
+          <button type="button" id="cancel-edit-btn" class="secondary-btn" hidden>CANCEL</button>
         </div>
+
         <div id="form-error" class="form-error" role="alert" aria-live="polite"></div>
       </form>
     </section>
 
-    <section class="panel" aria-labelledby="saved-prompts-heading">
+    <section class="panel panel-list" aria-labelledby="saved-prompts-heading">
       <div class="panel-header">
-        <h2 id="saved-prompts-heading" class="panel-title">Saved Prompts</h2>
-        <span id="prompt-count" class="count-badge" aria-live="polite"></span>
+        <h2 id="saved-prompts-heading" class="panel-title">SAVED PROMPTS</h2>
       </div>
+
+      <div class="search-sort-bar">
+        <div class="search-box">
+          <svg class="search-icon" width="16" height="16" viewBox="0 0 16 16" fill="none">
+            <path d="M7 13A6 6 0 1 0 7 1a6 6 0 0 0 0 12zM13 13l2.5 2.5" stroke="currentColor" stroke-width="2"
+              stroke-linecap="round" />
+          </svg>
+          <input type="text" id="search-input" placeholder="Search prompts..." aria-label="Search prompts"
+            autocomplete="off" />
+          <button type="button" id="clear-search-btn" class="clear-search-btn" aria-label="Clear search"
+            hidden>×</button>
+        </div>
+
+        <select id="sort-select" class="sort-select" aria-label="Sort prompts">
+          <option value="date-desc">Newest First</option>
+          <option value="date-asc">Oldest First</option>
+          <option value="title-asc">Title A-Z</option>
+          <option value="title-desc">Title Z-A</option>
+          <option value="rating-desc">Highest Rated</option>
+        </select>
+      </div>
+
       <div id="import-export-messages" class="iemessages" role="alert" aria-live="polite" hidden></div>
+
       <div id="prompts-empty" class="empty-state" hidden>
         <p>No prompts saved yet. Add your first one!</p>
       </div>
+
       <div id="prompts-list" class="cards" aria-live="polite"></div>
     </section>
   </main>
 
   <template id="prompt-card-template">
     <article class="card" data-id="">
-      <div class="card-main">
+      <div class="card-header">
         <h3 class="card-title"></h3>
-        <p class="card-preview"></p>
-        <div class="prompt-meta" data-role="metadata"></div>
+        <div class="card-actions">
+          <button class="action-btn copy-btn" type="button" aria-label="Copy prompt" title="Copy">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <rect x="5" y="5" width="9" height="9" rx="1" stroke="currentColor" stroke-width="1.5" />
+              <path d="M3 11V3a1 1 0 0 1 1-1h8" stroke="currentColor" stroke-width="1.5" />
+            </svg>
+          </button>
+          <button class="action-btn delete-btn" type="button" aria-label="Delete prompt" title="Delete">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none">
+              <path d="M3 4h10M6 4V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1m2 0v9a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4h8z"
+                stroke="currentColor" stroke-width="1.5" />
+            </svg>
+          </button>
+        </div>
       </div>
-      <div class="card-actions">
-        <button class="delete-btn" type="button" aria-label="Delete prompt">Delete</button>
+
+      <p class="card-preview"></p>
+
+      <div class="card-footer">
+        <div class="prompt-meta" data-role="metadata"></div>
       </div>
     </article>
   </template>
 
-  <footer class="app-footer">Local-only storage. Clearing browser data will remove prompts.</footer>
+  <footer class="app-footer">
+    <p>Local only. Data stored in your browser (localStorage). 🔒</p>
+  </footer>
 
   <script src="script.js"></script>
 </body>
+
 </html>

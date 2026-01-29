@@ -1,18 +1,101 @@
 (function() {
+  'use strict';
+  
+  // ============================================================================
+  // CONSTANTS
+  // ============================================================================
+  
   const STORAGE_KEY = 'promptLibrary.items.v1';
-  const NOTES_KEY = 'promptNotes.v1'; // localStorage key for notes
+  const NOTES_KEY = 'promptNotes.v1';
   const META_VERSION = 'v1';
+  const EXPORT_FILE_BASENAME = 'prompt-library-backup';
+  const EXPORT_SCHEMA_VERSION = 1;
+  const MAX_STARS = 5;
 
+  // ============================================================================
+  // DOM REFERENCES
+  // ============================================================================
+  
   const form = document.getElementById('prompt-form');
   const titleInput = document.getElementById('prompt-title');
   const contentInput = document.getElementById('prompt-content');
   const modelInput = document.getElementById('model-name');
+  const editIdInput = document.getElementById('edit-id');
   const errorEl = document.getElementById('form-error');
   const listEl = document.getElementById('prompts-list');
   const emptyEl = document.getElementById('prompts-empty');
-  const countEl = document.getElementById('prompt-count');
   const cardTemplate = document.getElementById('prompt-card-template');
+  const formModeLabel = document.getElementById('form-mode-label');
+  const saveBtnText = document.getElementById('save-btn-text');
+  const cancelEditBtn = document.getElementById('cancel-edit-btn');
+  const clearBtn = document.getElementById('clear-btn');
+  const searchInput = document.getElementById('search-input');
+  const clearSearchBtn = document.getElementById('clear-search-btn');
+  const sortSelect = document.getElementById('sort-select');
 
+  // ============================================================================
+  // STATE
+  // ============================================================================
+  
+  let currentPrompts = [];
+  let currentSearchTerm = '';
+  let currentSortBy = 'date-desc';
+  let isEditMode = false;
+
+  // ============================================================================
+  // UTILITY FUNCTIONS
+  // ============================================================================
+  
+  function trim(str) { 
+    return (str || '').trim(); 
+  }
+
+  function createId() {
+    return 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  }
+
+  function preview(text, wordCount = 16) {
+    const words = trim(text).split(/\s+/).slice(0, wordCount);
+    return words.join(' ');
+  }
+
+  function formatDate(dateString) {
+    try {
+      const date = new Date(dateString);
+      return date.toLocaleDateString('en-US', { 
+        month: 'short', 
+        day: 'numeric',
+        year: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch {
+      return 'Unknown';
+    }
+  }
+
+  function debounce(func, wait) {
+    let timeout;
+    return function executedFunction(...args) {
+      const later = () => {
+        clearTimeout(timeout);
+        func(...args);
+      };
+      clearTimeout(timeout);
+      timeout = setTimeout(later, wait);
+    };
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  // ============================================================================
+  // STORAGE FUNCTIONS
+  // ============================================================================
+  
   function loadPrompts() {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -29,98 +112,279 @@
     }
   }
 
+  function savePrompts(prompts) {
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(prompts));
+      currentPrompts = prompts;
+    } catch (e) {
+      console.error('Failed to save prompts', e);
+      showError('Failed to save. Storage may be full.');
+    }
+  }
+
   function hydrateLegacyPrompt(p) {
-    // If metadata already exists and passes minimal validation, return as-is
     if (p && p.metadata && typeof p.metadata === 'object' && p.metadata.model && p.metadata.createdAt) {
+      if (!('userRating' in p)) p.userRating = null;
       return p;
     }
     try {
       const model = typeof p.model === 'string' ? p.model : 'unknown-model';
       const meta = trackModel(model, p.content || '');
       p.metadata = meta;
+      p.userRating = p.userRating || null;
       return p;
     } catch {
-      // Fallback minimal metadata
       p.metadata = {
         model: 'unknown',
         createdAt: new Date(p.createdAt || Date.now()).toISOString(),
         updatedAt: new Date(p.createdAt || Date.now()).toISOString(),
-        tokenEstimate: estimateTokens(p.content || '', false)
+        tokenEstimate: estimateTokens(p.content || '', true)
       };
+      p.userRating = null;
       return p;
     }
   }
 
-  function savePrompts(prompts) {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(prompts));
-    } catch (e) {
-      console.error('Failed to save prompts', e);
+  // ============================================================================
+  // TOKEN ESTIMATION
+  // ============================================================================
+  
+  function estimateTokens(text, detailed = true) {
+    if (!text || typeof text !== 'string') {
+      return detailed ? { min: 0, max: 0, avg: 0, confidence: 'low' } : 0;
     }
+    const chars = text.length;
+    const words = text.split(/\s+/).filter(w => w.length > 0).length;
+    const avgTokenPerWord = 1.3;
+    const avgTokenPerChar = 0.25;
+    const wordEst = Math.ceil(words * avgTokenPerWord);
+    const charEst = Math.ceil(chars * avgTokenPerChar);
+    const avg = Math.ceil((wordEst + charEst) / 2);
+    const min = Math.floor(avg * 0.85);
+    const max = Math.ceil(avg * 1.15);
+    
+    let confidence = 'medium';
+    if (words > 100) confidence = 'high';
+    else if (words < 20) confidence = 'low';
+    
+    return detailed ? { min, max, avg, confidence } : avg;
   }
 
-  function createId() {
-    return 'p_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  function trackModel(modelName, content) {
+    const now = new Date().toISOString();
+    return {
+      model: modelName,
+      createdAt: now,
+      updatedAt: now,
+      tokenEstimate: estimateTokens(content, true)
+    };
   }
 
-  function trim(str) { return (str || '').trim(); }
+  // ============================================================================
+  // FORM HANDLING
+  // ============================================================================
+  
+  function showError(message) {
+    errorEl.textContent = message;
+    setTimeout(() => errorEl.textContent = '', 5000);
+  }
 
-  function render(prompts) {
-    listEl.innerHTML = '';
+  function clearForm() {
+    form.reset();
+    editIdInput.value = '';
+    errorEl.textContent = '';
+    isEditMode = false;
+    formModeLabel.textContent = 'ADD A PROMPT';
+    saveBtnText.textContent = 'SAVE PROMPT';
+    cancelEditBtn.hidden = true;
+  }
 
-    if (!prompts.length) {
-      emptyEl.hidden = false;
-      countEl.textContent = '0';
-      return;
+  function validateForm() {
+    const title = trim(titleInput.value);
+    const content = trim(contentInput.value);
+    const model = trim(modelInput.value);
+
+    if (!title) {
+      showError('Title is required');
+      titleInput.focus();
+      return false;
     }
-    emptyEl.hidden = true;
-    countEl.textContent = String(prompts.length);
+    if (!model) {
+      showError('Model is required');
+      modelInput.focus();
+      return false;
+    }
+    if (!content) {
+      showError('Content is required');
+      contentInput.focus();
+      return false;
+    }
+    return true;
+  }
 
-    const frag = document.createDocumentFragment();
-    prompts.forEach(p => {
-      const node = cardTemplate.content.firstElementChild.cloneNode(true);
-      node.dataset.id = p.id;
-      node.querySelector('.card-title').textContent = p.title;
-      node.querySelector('.card-preview').textContent = preview(p.content);
-      const delBtn = node.querySelector('.delete-btn');
-      delBtn.addEventListener('click', () => deletePrompt(p.id));
+  function handleFormSubmit(e) {
+    e.preventDefault();
+    
+    if (!validateForm()) return;
 
-      // Metadata injection
-      const metaHost = node.querySelector('[data-role=metadata]');
-      if (metaHost) {
-        try {
-          metaHost.replaceChildren(buildMetadataDisplay(p.metadata));
-        } catch (err) {
-          console.warn('Failed to render metadata', err);
-          metaHost.textContent = 'Metadata error';
-        }
+    const title = trim(titleInput.value);
+    const content = trim(contentInput.value);
+    const model = trim(modelInput.value);
+    const editId = trim(editIdInput.value);
+
+    const prompts = loadPrompts();
+
+    if (editId) {
+      const index = prompts.findIndex(p => p.id === editId);
+      if (index !== -1) {
+        prompts[index] = {
+          ...prompts[index],
+          title,
+          content,
+          metadata: {
+            ...prompts[index].metadata,
+            model,
+            updatedAt: new Date().toISOString(),
+            tokenEstimate: estimateTokens(content, true)
+          }
+        };
       }
+    } else {
+      const newPrompt = {
+        id: createId(),
+        title,
+        content,
+        userRating: null,
+        metadata: trackModel(model, content)
+      };
+      prompts.unshift(newPrompt);
+    }
 
-      // Rating component mount point (insert before actions)
-      const main = node.querySelector('.card-main');
-      main.appendChild(buildRatingElement(p));
-      // Notes section injection
-      main.appendChild(buildNotesSection(p.id));
-      frag.appendChild(node);
-    });
-    listEl.appendChild(frag);
-  }
-
-  function preview(text) {
-    const words = trim(text).split(/\s+/).slice(0, 12);
-    const joined = words.join(' ');
-    return joined + (trim(text).split(/\s+/).length > words.length ? ' …' : '');
+    savePrompts(prompts);
+    clearForm();
+    applyFiltersAndRender();
+    
+    if (listEl.firstElementChild) {
+      listEl.firstElementChild.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
   }
 
   function deletePrompt(id) {
+    // No confirmation - just delete
     const prompts = loadPrompts().filter(p => p.id !== id);
     savePrompts(prompts);
+    
+    const notesStore = loadNotesStore();
+    if (notesStore[id]) {
+      delete notesStore[id];
+      saveNotesStore(notesStore);
+    }
+    
+    applyFiltersAndRender();
+    showIEMessage('Prompt deleted', 'success');
+  }
+
+  // ============================================================================
+  // COPY TO CLIPBOARD
+  // ============================================================================
+  
+  async function copyToClipboard(text, button) {
+    try {
+      await navigator.clipboard.writeText(text);
+      
+      button.classList.add('copied');
+      const originalHTML = button.innerHTML;
+      button.innerHTML = '<svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M13 4L6 11L3 8" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      
+      setTimeout(() => {
+        button.classList.remove('copied');
+        button.innerHTML = originalHTML;
+      }, 1500);
+      
+      showIEMessage('Copied to clipboard!', 'success');
+    } catch (err) {
+      console.error('Failed to copy:', err);
+      showIEMessage('Failed to copy', 'error');
+    }
+  }
+
+  // ============================================================================
+  // SEARCH & FILTER
+  // ============================================================================
+  
+  function filterPrompts(prompts, searchTerm) {
+    if (!searchTerm) return prompts;
+    
+    const term = searchTerm.toLowerCase();
+    return prompts.filter(p => {
+      const titleMatch = (p.title || '').toLowerCase().includes(term);
+      const contentMatch = (p.content || '').toLowerCase().includes(term);
+      const modelMatch = (p.metadata?.model || '').toLowerCase().includes(term);
+      return titleMatch || contentMatch || modelMatch;
+    });
+  }
+
+  function sortPrompts(prompts, sortBy) {
+    const sorted = [...prompts];
+    
+    switch(sortBy) {
+      case 'date-desc':
+        return sorted.sort((a, b) => 
+          new Date(b.metadata?.createdAt || 0) - new Date(a.metadata?.createdAt || 0)
+        );
+      case 'date-asc':
+        return sorted.sort((a, b) => 
+          new Date(a.metadata?.createdAt || 0) - new Date(b.metadata?.createdAt || 0)
+        );
+      case 'title-asc':
+        return sorted.sort((a, b) => 
+          (a.title || '').localeCompare(b.title || '')
+        );
+      case 'title-desc':
+        return sorted.sort((a, b) => 
+          (b.title || '').localeCompare(a.title || '')
+        );
+      case 'rating-desc':
+        return sorted.sort((a, b) => {
+          const ratingA = a.userRating || 0;
+          const ratingB = b.userRating || 0;
+          if (ratingB !== ratingA) return ratingB - ratingA;
+          return new Date(b.metadata?.createdAt || 0) - new Date(a.metadata?.createdAt || 0);
+        });
+      default:
+        return sorted;
+    }
+  }
+
+  function applyFiltersAndRender() {
+    let prompts = loadPrompts();
+    prompts = filterPrompts(prompts, currentSearchTerm);
+    prompts = sortPrompts(prompts, currentSortBy);
     render(prompts);
   }
 
-  /* Rating Logic */
-  const MAX_STARS = 5;
+  function handleSearch(e) {
+    currentSearchTerm = trim(e.target.value);
+    clearSearchBtn.hidden = !currentSearchTerm;
+    applyFiltersAndRender();
+  }
 
+  function clearSearch() {
+    searchInput.value = '';
+    currentSearchTerm = '';
+    clearSearchBtn.hidden = true;
+    applyFiltersAndRender();
+  }
+
+  function handleSortChange(e) {
+    currentSortBy = e.target.value;
+    applyFiltersAndRender();
+  }
+
+  // ============================================================================
+  // RATING SYSTEM - FIXED
+  // ============================================================================
+  
   function normalizeRating(val) {
     if (val == null) return null;
     const n = Number(val);
@@ -128,39 +392,56 @@
   }
 
   function setRating(promptId, value) {
+    console.log('setRating called:', promptId, value);
     const prompts = loadPrompts();
     const prompt = prompts.find(p => p.id === promptId);
-    if (!prompt) return;
+    if (!prompt) {
+      console.warn('Prompt not found:', promptId);
+      return;
+    }
+    
     const current = normalizeRating(prompt.userRating);
     const next = normalizeRating(value);
-    // Toggle off if same value clicked
-    prompt.userRating = (current && next && current === next) ? null : next;
+    
+    // Toggle off if clicking the same star, otherwise set the new rating
+    if (current === next) {
+      prompt.userRating = null;
+    } else {
+      prompt.userRating = next;
+    }
+    
+    console.log('Updating rating from', current, 'to', prompt.userRating);
     savePrompts(prompts);
     updateCardRatingUI(promptId, prompt.userRating);
   }
 
   function buildRatingElement(prompt) {
-    // Ensure property exists for legacy stored prompts
     if (!('userRating' in prompt)) prompt.userRating = null;
+    
     const wrap = document.createElement('div');
     wrap.className = 'rating';
+    wrap.dataset.promptId = prompt.id;
     wrap.setAttribute('role', 'radiogroup');
     wrap.setAttribute('aria-label', `Rate ${prompt.title}`);
+    
     for (let i = 1; i <= MAX_STARS; i++) {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'star' + (prompt.userRating >= i ? ' filled' : '');
+      btn.className = 'star' + (prompt.userRating && prompt.userRating >= i ? ' filled' : '');
       btn.dataset.value = String(i);
+      btn.dataset.promptId = prompt.id;
       btn.setAttribute('role', 'radio');
       btn.setAttribute('aria-checked', String(prompt.userRating === i));
       btn.setAttribute('aria-label', `${i} star${i>1?'s':''}`);
-      btn.textContent = prompt.userRating >= i ? '★' : '☆';
-      btn.addEventListener('click', () => setRating(prompt.id, i));
-      btn.addEventListener('keydown', (e) => handleStarKey(e, prompt.id));
-      btn.addEventListener('pointerenter', () => previewHover(wrap, i));
-      btn.addEventListener('pointerleave', () => clearHover(wrap, prompt.userRating));
+      btn.textContent = (prompt.userRating && prompt.userRating >= i) ? '★' : '☆';
+      
+      // Hover preview
+      btn.addEventListener('mouseenter', () => previewHover(wrap, i));
+      btn.addEventListener('mouseleave', () => clearHover(wrap, prompt.userRating));
+      
       wrap.appendChild(btn);
     }
+    
     return wrap;
   }
 
@@ -169,6 +450,7 @@
     if (!card) return;
     const wrap = card.querySelector('.rating');
     if (!wrap) return;
+    
     [...wrap.querySelectorAll('button.star')].forEach(btn => {
       const val = Number(btn.dataset.value);
       const filled = rating != null && rating >= val;
@@ -183,6 +465,7 @@
     const target = e.currentTarget;
     if (!target || !target.dataset.value) return;
     const currentVal = Number(target.dataset.value);
+    
     if (['ArrowRight','ArrowUp'].includes(key)) {
       e.preventDefault();
       const next = Math.min(MAX_STARS, currentVal + 1);
@@ -195,99 +478,94 @@
       focusStar(promptId, prev);
     } else if (key === 'Home') {
       e.preventDefault();
-      setRating(promptId, 1); focusStar(promptId, 1);
+      setRating(promptId, 1);
+      focusStar(promptId, 1);
     } else if (key === 'End') {
       e.preventDefault();
-      setRating(promptId, MAX_STARS); focusStar(promptId, MAX_STARS);
+      setRating(promptId, MAX_STARS);
+      focusStar(promptId, MAX_STARS);
     } else if (key === 'Enter' || key === ' ') {
       e.preventDefault();
       setRating(promptId, currentVal);
-    } else if (key === 'Backspace' || key === 'Delete' || key === 'Escape') {
-      e.preventDefault();
-      setRating(promptId, null);
     }
   }
 
-  function focusStar(promptId, starVal) {
+  function focusStar(promptId, value) {
     const card = listEl.querySelector(`[data-id="${promptId}"]`);
     if (!card) return;
-    const star = card.querySelector(`.rating button.star[data-value="${starVal}"]`);
-    if (star) star.focus();
+    const btn = card.querySelector(`.star[data-value="${value}"]`);
+    if (btn) btn.focus();
   }
 
-  function previewHover(wrap, hoverVal) {
-    wrap.setAttribute('data-hovering', 'true');
-    wrap.querySelectorAll('button.star').forEach(btn => {
+  function previewHover(wrap, value) {
+    [...wrap.querySelectorAll('button.star')].forEach(btn => {
       const val = Number(btn.dataset.value);
-      btn.textContent = val <= hoverVal ? '★' : '☆';
-    });
-  }
-  function clearHover(wrap, rating) {
-    wrap.removeAttribute('data-hovering');
-    wrap.querySelectorAll('button.star').forEach(btn => {
-      const val = Number(btn.dataset.value);
-      btn.textContent = rating && val <= rating ? '★' : '☆';
+      const shouldFill = val <= value;
+      btn.classList.toggle('filled', shouldFill);
+      btn.textContent = shouldFill ? '★' : '☆';
     });
   }
 
-  function handleSubmit(e) {
-    e.preventDefault();
-    errorEl.textContent = '';
-
-    const title = trim(titleInput.value);
-    const content = trim(contentInput.value);
-  const modelName = trim(modelInput.value);
-
-    if (!title) {
-      errorEl.textContent = 'Title is required.';
-      titleInput.focus();
-      return;
-    }
-    if (!content) {
-      errorEl.textContent = 'Content is required.';
-      contentInput.focus();
-      return;
-    }
-    if (!modelName) {
-      errorEl.textContent = 'Model is required.';
-      modelInput.focus();
-      return;
-    }
-
-    let metadata;
-    try {
-      metadata = trackModel(modelName, content);
-    } catch (err) {
-      errorEl.textContent = err.message || 'Metadata creation failed.';
-      return;
-    }
-
-    const prompts = loadPrompts();
-    prompts.unshift({ id: createId(), title, content, metadata });
-    savePrompts(prompts);
-    render(prompts);
-
-    form.reset();
-    titleInput.focus();
+  function clearHover(wrap, currentRating) {
+    [...wrap.querySelectorAll('button.star')].forEach(btn => {
+      const val = Number(btn.dataset.value);
+      const filled = currentRating != null && currentRating >= val;
+      btn.classList.toggle('filled', filled);
+      btn.textContent = filled ? '★' : '☆';
+    });
   }
 
-  function init() {
-    form.addEventListener('submit', handleSubmit);
-    render(loadPrompts());
-    setupImportExport();
+  // ============================================================================
+  // METADATA DISPLAY
+  // ============================================================================
+  
+  function buildMetadataDisplay(metadata) {
+    if (!metadata || typeof metadata !== 'object') {
+      return document.createTextNode('No metadata');
+    }
+    
+    const frag = document.createDocumentFragment();
+    const row = document.createElement('div');
+    row.className = 'prompt-meta-row';
+    
+    if (metadata.model) {
+      const modelSpan = document.createElement('span');
+      modelSpan.className = 'prompt-meta-tag';
+      modelSpan.innerHTML = `<span class="model-name">${escapeHtml(metadata.model)}</span>`;
+      row.appendChild(modelSpan);
+    }
+    
+    const tokenEst = metadata.tokenEstimate;
+    if (tokenEst && typeof tokenEst === 'object') {
+      const tokenSpan = document.createElement('span');
+      tokenSpan.className = 'token-estimate';
+      tokenSpan.dataset.confidence = tokenEst.confidence || 'medium';
+      tokenSpan.innerHTML = `<span class="token-range">${tokenEst.min}-${tokenEst.max}</span>`;
+      row.appendChild(tokenSpan);
+    }
+    
+    if (metadata.createdAt) {
+      const timeTag = document.createElement('time');
+      timeTag.dateTime = metadata.createdAt;
+      timeTag.textContent = formatDate(metadata.createdAt);
+      row.appendChild(timeTag);
+    }
+    
+    frag.appendChild(row);
+    return frag;
   }
 
-  /* ================= Notes Feature ================= */
-  // Data shape: { [promptId]: [ { id, content, createdAt, updatedAt } ] }
-
+  // ============================================================================
+  // NOTES SYSTEM
+  // ============================================================================
+  
   function loadNotesStore() {
     try {
       const raw = localStorage.getItem(NOTES_KEY);
       if (!raw) return {};
       const data = JSON.parse(raw);
       return data && typeof data === 'object' ? data : {};
-    } catch (e) {
-      console.warn('Notes storage corrupted, resetting.', e);
+    } catch {
       return {};
     }
   }
@@ -296,438 +574,261 @@
     try {
       localStorage.setItem(NOTES_KEY, JSON.stringify(store));
     } catch (e) {
-      console.error('Failed to persist notes', e);
-      // Could expose inline error in each notes section on next render
+      console.error('Failed to save notes', e);
     }
-  }
-
-  function getNotes(promptId) {
-    const store = loadNotesStore();
-    const arr = Array.isArray(store[promptId]) ? store[promptId] : [];
-    return arr
-      .filter(n => n && typeof n.id === 'string' && typeof n.content === 'string')
-      .sort((a,b) => b.createdAt - a.createdAt);
-  }
-
-  function addNote(promptId, content) {
-    const trimmed = (content || '').trim();
-    if (!trimmed) return { error: 'Note cannot be empty.' };
-    const store = loadNotesStore();
-    if (!Array.isArray(store[promptId])) store[promptId] = [];
-    const note = { id: noteId(), content: trimmed, createdAt: Date.now(), updatedAt: Date.now() };
-    store[promptId].unshift(note);
-    saveNotesStore(store);
-    return { note };
-  }
-
-  function updateNote(promptId, noteIdVal, newContent) {
-    const store = loadNotesStore();
-    const list = Array.isArray(store[promptId]) ? store[promptId] : [];
-    const note = list.find(n => n.id === noteIdVal);
-    if (!note) return { error: 'Note not found.' };
-    const val = (newContent || '').trim();
-    if (!val) return { error: 'Note cannot be empty.' };
-    note.content = val;
-    note.updatedAt = Date.now();
-    saveNotesStore(store);
-    return { note };
-  }
-
-  function deleteNote(promptId, noteIdVal) {
-    const store = loadNotesStore();
-    const list = Array.isArray(store[promptId]) ? store[promptId] : [];
-    const idx = list.findIndex(n => n.id === noteIdVal);
-    if (idx === -1) return false;
-    list.splice(idx, 1);
-    saveNotesStore(store);
-    return true;
-  }
-
-  function noteId() {
-    return 'note_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,6);
   }
 
   function buildNotesSection(promptId) {
-    const wrap = document.createElement('section');
-    wrap.className = 'notes';
-    wrap.dataset.promptId = promptId;
-    wrap.setAttribute('aria-labelledby', `notes-title-${promptId}`);
-    wrap.innerHTML = `
-      <div class="notes-header">
-        <h4 id="notes-title-${promptId}" class="notes-title">Notes</h4>
-        <button type="button" class="add-note-btn" data-action="add-note" aria-label="Add note" data-prompt-id="${promptId}">Add</button>
-      </div>
-      <div class="notes-error" hidden></div>
-      <ul class="notes-list" role="list"></ul>
-    `;
-    renderNotesList(promptId, wrap.querySelector('.notes-list'));
-    attachNotesHandlers(wrap);
-    return wrap;
+    const section = document.createElement('div');
+    section.className = 'notes';
+    
+    const header = document.createElement('div');
+    header.className = 'notes-header';
+    
+    const title = document.createElement('h4');
+    title.className = 'notes-title';
+    title.textContent = 'Notes';
+    
+    const addBtn = document.createElement('button');
+    addBtn.type = 'button';
+    addBtn.className = 'add-note-btn';
+    addBtn.textContent = '+ Add';
+    addBtn.addEventListener('click', () => addNote(promptId));
+    
+    header.appendChild(title);
+    header.appendChild(addBtn);
+    section.appendChild(header);
+    
+    const list = document.createElement('ul');
+    list.className = 'notes-list';
+    list.dataset.promptId = promptId;
+    
+    const notes = loadNotesStore()[promptId] || [];
+    notes.forEach(note => {
+      list.appendChild(buildNoteElement(note, promptId));
+    });
+    
+    section.appendChild(list);
+    return section;
   }
 
-  function renderNotesList(promptId, listRoot) {
-    listRoot.innerHTML = '';
-    const notes = getNotes(promptId);
-    if (!notes.length) {
-      const empty = document.createElement('li');
-      empty.innerHTML = '<p class="note-content" style="margin:0;font-size:.6rem;color:var(--text-soft);">No notes yet.</p>';
-      listRoot.appendChild(empty);
-      return;
-    }
-    const frag = document.createDocumentFragment();
-    notes.forEach(n => frag.appendChild(renderNoteItem(promptId, n)));
-    listRoot.appendChild(frag);
-  }
-
-  function renderNoteItem(promptId, note) {
+  function buildNoteElement(note, promptId) {
     const li = document.createElement('li');
     li.className = 'note';
     li.dataset.noteId = note.id;
-    const edited = note.updatedAt && note.updatedAt !== note.createdAt;
-    li.innerHTML = `
-      <p class="note-content" data-role="content"></p>
-      <div class="note-meta">
-        <time>${formatTs(note.createdAt)}${edited ? ' · Edited' : ''}</time>
-        <div class="note-buttons">
-          <button type="button" data-action="edit-note" aria-label="Edit note">Edit</button>
-          <button type="button" data-action="delete-note" aria-label="Delete note">Del</button>
-        </div>
-      </div>
-    `;
-    li.querySelector('[data-role=content]').textContent = note.content;
+    
+    const content = document.createElement('p');
+    content.className = 'note-content';
+    content.textContent = note.text;
+    
+    const meta = document.createElement('div');
+    meta.className = 'note-meta';
+    
+    const time = document.createElement('time');
+    time.dateTime = note.createdAt;
+    time.textContent = formatDate(note.createdAt);
+    
+    const buttons = document.createElement('div');
+    buttons.className = 'note-buttons';
+    
+    const editBtn = document.createElement('button');
+    editBtn.type = 'button';
+    editBtn.textContent = 'Edit';
+    editBtn.dataset.action = 'edit-note';
+    editBtn.addEventListener('click', () => editNote(promptId, note.id, li));
+    
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.textContent = 'Delete';
+    deleteBtn.dataset.action = 'delete-note';
+    deleteBtn.addEventListener('click', () => deleteNote(promptId, note.id));
+    
+    buttons.appendChild(editBtn);
+    buttons.appendChild(deleteBtn);
+    meta.appendChild(time);
+    meta.appendChild(buttons);
+    
+    li.appendChild(content);
+    li.appendChild(meta);
+    
     return li;
   }
 
-  function formatTs(ts) {
-    try {
-      const d = new Date(ts);
-      return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-    } catch { return '—'; }
+  function addNote(promptId) {
+    const notesStore = loadNotesStore();
+    if (!Array.isArray(notesStore[promptId])) {
+      notesStore[promptId] = [];
+    }
+    
+    const newNote = {
+      id: createId(),
+      text: '',
+      createdAt: new Date().toISOString()
+    };
+    
+    notesStore[promptId].push(newNote);
+    saveNotesStore(notesStore);
+    
+    const list = document.querySelector(`.notes-list[data-prompt-id="${promptId}"]`);
+    if (list) {
+      const noteEl = buildNoteElement(newNote, promptId);
+      list.appendChild(noteEl);
+      editNote(promptId, newNote.id, noteEl);
+    }
   }
 
-  function attachNotesHandlers(section) {
-    section.addEventListener('click', (e) => {
-      const target = e.target;
-      if (!(target instanceof HTMLElement)) return;
-      const action = target.dataset.action;
-      if (!action) return;
-      const promptId = section.dataset.promptId;
-      if (!promptId) return;
-      if (action === 'add-note') {
-        spawnNewNoteEditor(section, promptId);
-      } else if (action === 'edit-note') {
-        const noteEl = target.closest('.note');
-        if (noteEl) enterEditNote(section, promptId, noteEl.dataset.noteId);
-      } else if (action === 'delete-note') {
-        const noteEl = target.closest('.note');
-        if (noteEl && confirm('Delete this note?')) {
-          deleteNote(promptId, noteEl.dataset.noteId);
-          renderNotesList(promptId, section.querySelector('.notes-list'));
-        }
-      } else if (action === 'save-note') {
-        const editor = target.closest('.note');
-        if (editor) commitNoteEdit(section, promptId, editor, false);
-      } else if (action === 'cancel-note') {
-        const editor = target.closest('.note');
-        if (editor) cancelNoteEdit(section, promptId, editor);
+  function editNote(promptId, noteId, noteEl) {
+    const notesStore = loadNotesStore();
+    const notes = notesStore[promptId] || [];
+    const note = notes.find(n => n.id === noteId);
+    if (!note) return;
+    
+    noteEl.classList.add('editing');
+    
+    const textarea = document.createElement('textarea');
+    textarea.value = note.text;
+    textarea.placeholder = 'Enter note...';
+    
+    const controls = document.createElement('div');
+    controls.className = 'note-controls';
+    
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.textContent = 'Save';
+    
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.textContent = 'Cancel';
+    
+    const validation = document.createElement('div');
+    validation.className = 'note-validation';
+    
+    const save = () => {
+      const text = trim(textarea.value);
+      if (!text) {
+        validation.textContent = 'Note cannot be empty';
+        return;
       }
-    });
-    section.addEventListener('keydown', (e) => {
-      const target = e.target;
-      if (!(target instanceof HTMLTextAreaElement)) return;
-      if (e.key === 'Escape') {
-        const editor = target.closest('.note');
-        if (editor) cancelNoteEdit(section, section.dataset.promptId, editor);
-      } else if ((e.key === 'Enter' && (e.metaKey || e.ctrlKey))) {
-        const editor = target.closest('.note');
-        if (editor) commitNoteEdit(section, section.dataset.promptId, editor, false);
-      }
-    });
-  }
-
-  function spawnNewNoteEditor(section, promptId) {
-    // Prevent multiple new editors at once
-    if (section.querySelector('.note.editing[data-mode=new]')) {
-      section.querySelector('.note.editing[data-mode=new] textarea')?.focus();
-      return;
-    }
-    const listRoot = section.querySelector('.notes-list');
-    const li = document.createElement('li');
-    li.className = 'note editing';
-    li.dataset.mode = 'new';
-    li.innerHTML = `
-      <div>
-        <label class="visually-hidden" for="new-note-${promptId}">New note</label>
-        <textarea id="new-note-${promptId}" data-role="editor" placeholder="Write a note..." aria-label="New note"></textarea>
-        <div class="note-validation" data-role="validation"></div>
-      </div>
-      <div class="note-controls">
-        <button type="button" data-action="save-note">Save</button>
-        <button type="button" data-action="cancel-note">Cancel</button>
-      </div>
-    `;
-    listRoot.insertBefore(li, listRoot.firstChild);
-    li.querySelector('textarea').focus();
-  }
-
-  function enterEditNote(section, promptId, noteIdVal) {
-    const node = section.querySelector(`.note[data-note-id="${noteIdVal}"]`);
-    if (!node || node.classList.contains('editing')) return;
-    const contentEl = node.querySelector('[data-role=content]');
-    const original = contentEl.textContent || '';
-    node.classList.add('editing');
-    node.dataset.mode = 'edit';
-    node.dataset.original = original;
-    node.innerHTML = `
-      <div>
-        <label class="visually-hidden" for="edit-${noteIdVal}">Edit note</label>
-        <textarea id="edit-${noteIdVal}" data-role="editor" aria-label="Edit note">${escapeHtml(original)}</textarea>
-        <div class="note-validation" data-role="validation"></div>
-      </div>
-      <div class="note-controls">
-        <button type="button" data-action="save-note">Save</button>
-        <button type="button" data-action="cancel-note">Cancel</button>
-      </div>
-    `;
-    node.querySelector('textarea').focus();
-  }
-
-  function commitNoteEdit(section, promptId, editorNode, silent) {
-    const textarea = editorNode.querySelector('textarea');
-    if (!textarea) return;
-    const validationEl = editorNode.querySelector('[data-role=validation]');
-    const mode = editorNode.dataset.mode;
-    const value = textarea.value.trim();
-    if (!value) {
-      validationEl.textContent = 'Note cannot be empty.';
-      textarea.focus();
-      return;
-    }
-    if (mode === 'new') {
-      const { error } = addNote(promptId, value);
-      if (error) { validationEl.textContent = error; return; }
-    } else if (mode === 'edit') {
-      const noteIdVal = editorNode.dataset.noteId;
-      const { error } = updateNote(promptId, noteIdVal, value);
-      if (error) { validationEl.textContent = error; return; }
-    }
-    renderNotesList(promptId, section.querySelector('.notes-list'));
-  }
-
-  function cancelNoteEdit(section, promptId, editorNode) {
-    const mode = editorNode.dataset.mode;
-    if (mode === 'new') {
-      editorNode.remove();
-      // If list now empty, re-render to show empty state message
-      const list = section.querySelector('.notes-list');
-      if (!list.querySelector('.note')) renderNotesList(promptId, list);
-    } else if (mode === 'edit') {
-      // Restore original
-      const original = editorNode.dataset.original || '';
-      const noteIdVal = editorNode.dataset.noteId;
-      const storeNote = getNotes(promptId).find(n => n.id === noteIdVal);
-      if (storeNote) {
-        const replacement = renderNoteItem(promptId, storeNote);
-        editorNode.replaceWith(replacement);
+      
+      note.text = text;
+      note.updatedAt = new Date().toISOString();
+      saveNotesStore(notesStore);
+      
+      const newNoteEl = buildNoteElement(note, promptId);
+      noteEl.replaceWith(newNoteEl);
+    };
+    
+    const cancel = () => {
+      if (!note.text) {
+        deleteNote(promptId, noteId);
       } else {
-        editorNode.remove();
+        const newNoteEl = buildNoteElement(note, promptId);
+        noteEl.replaceWith(newNoteEl);
       }
+    };
+    
+    saveBtn.addEventListener('click', save);
+    cancelBtn.addEventListener('click', cancel);
+    textarea.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') cancel();
+      if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) save();
+    });
+    
+    controls.appendChild(saveBtn);
+    controls.appendChild(cancelBtn);
+    
+    noteEl.innerHTML = '';
+    noteEl.appendChild(textarea);
+    noteEl.appendChild(controls);
+    noteEl.appendChild(validation);
+    
+    textarea.focus();
+  }
+
+  function deleteNote(promptId, noteId) {
+    // No confirmation - just delete
+    const notesStore = loadNotesStore();
+    const notes = notesStore[promptId] || [];
+    notesStore[promptId] = notes.filter(n => n.id !== noteId);
+    saveNotesStore(notesStore);
+    
+    const noteEl = document.querySelector(`[data-note-id="${noteId}"]`);
+    if (noteEl) noteEl.remove();
+  }
+
+  // ============================================================================
+  // RENDERING
+  // ============================================================================
+  
+  function render(prompts) {
+    listEl.innerHTML = '';
+
+    if (!prompts.length) {
+      emptyEl.hidden = false;
+      return;
     }
+    
+    emptyEl.hidden = true;
+
+    const frag = document.createDocumentFragment();
+    
+    prompts.forEach(p => {
+      const node = cardTemplate.content.firstElementChild.cloneNode(true);
+      node.dataset.id = p.id;
+      
+      node.querySelector('.card-title').textContent = p.title;
+      node.querySelector('.card-preview').textContent = preview(p.content);
+      
+      const metaHost = node.querySelector('[data-role=metadata]');
+      if (metaHost) {
+        try {
+          metaHost.replaceChildren(buildMetadataDisplay(p.metadata));
+        } catch (err) {
+          console.warn('Failed to render metadata', err);
+          metaHost.textContent = 'Metadata error';
+        }
+      }
+      
+      const copyBtn = node.querySelector('.copy-btn');
+      copyBtn.addEventListener('click', () => copyToClipboard(p.content, copyBtn));
+      
+      const delBtn = node.querySelector('.delete-btn');
+      delBtn.addEventListener('click', () => deletePrompt(p.id));
+      
+      const footer = node.querySelector('.card-footer');
+      footer.appendChild(buildRatingElement(p));
+      
+      const cardMain = node.querySelector('.card-header').parentElement;
+      cardMain.appendChild(buildNotesSection(p.id));
+      
+      frag.appendChild(node);
+    });
+    
+    listEl.appendChild(frag);
   }
 
-  function escapeHtml(str) {
-    return str.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;','\'':'&#39;'}[c]));
-  }
-
-  document.addEventListener('DOMContentLoaded', init);
-
-  /* ================= Metadata System ================= */
-  // Types (JSDoc):
-  /**
-   * @typedef {Object} TokenEstimate
-   * @property {number} min
-   * @property {number} max
-   * @property {'high'|'medium'|'low'} confidence
-   */
-  /**
-   * @typedef {Object} MetadataObject
-   * @property {string} model
-   * @property {string} createdAt
-   * @property {string} updatedAt
-   * @property {TokenEstimate} tokenEstimate
-   */
-
-  function isIsoString(value) {
-    if (typeof value !== 'string') return false;
-    // Basic ISO 8601 UTC format validation
-    return /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value) && !isNaN(Date.parse(value));
-  }
-
-  /** Estimate tokens from text */
-  function estimateTokens(text, isCode) {
-    if (typeof text !== 'string') throw new Error('estimateTokens: text must be a string');
-    const words = text.trim() ? text.trim().split(/\s+/).length : 0;
-    const chars = text.length;
-    let min = Math.round(0.75 * words);
-    let max = Math.round(0.25 * chars);
-    if (isCode) {
-      min = Math.round(min * 1.3);
-      max = Math.round(max * 1.3);
-    }
-    if (min > max) { // ensure ordering
-      const tmp = min; min = max; max = tmp;
-    }
-    const span = Math.max(min, max);
-    let confidence = 'high';
-    if (span >= 1000 && span <= 5000) confidence = 'medium';
-    else if (span > 5000) confidence = 'low';
-    return { min, max, confidence };
-  }
-
-  /** Create metadata for a model & content */
-  function trackModel(modelName, content) {
-    if (typeof modelName !== 'string' || !modelName.trim()) {
-      throw new Error('trackModel: modelName must be a non-empty string');
-    }
-    const model = modelName.trim();
-    if (model.length > 100) throw new Error('trackModel: modelName exceeds 100 characters');
-    if (typeof content !== 'string') throw new Error('trackModel: content must be a string');
-    const createdAt = new Date().toISOString();
-    const tokenEstimate = estimateTokens(content, looksLikeCode(content));
-    const meta = { model, createdAt, updatedAt: createdAt, tokenEstimate, _v: META_VERSION };
-    validateMetadata(meta);
-    return meta;
-  }
-
-  /** Update updatedAt, enforcing ordering */
-  function updateTimestamps(metadata) {
-    if (!metadata || typeof metadata !== 'object') throw new Error('updateTimestamps: metadata object required');
-    if (!isIsoString(metadata.createdAt)) throw new Error('updateTimestamps: invalid createdAt');
-    const updatedAt = new Date().toISOString();
-    if (new Date(updatedAt) < new Date(metadata.createdAt)) {
-      throw new Error('updateTimestamps: updatedAt earlier than createdAt');
-    }
-    metadata.updatedAt = updatedAt;
-    validateMetadata(metadata);
-    return metadata;
-  }
-
-  function validateMetadata(meta) {
-    if (typeof meta.model !== 'string' || !meta.model.trim()) throw new Error('Metadata invalid: model required');
-    if (meta.model.length > 100) throw new Error('Metadata invalid: model too long');
-    if (!isIsoString(meta.createdAt)) throw new Error('Metadata invalid: createdAt not ISO string');
-    if (!isIsoString(meta.updatedAt)) throw new Error('Metadata invalid: updatedAt not ISO string');
-    if (new Date(meta.updatedAt) < new Date(meta.createdAt)) throw new Error('Metadata invalid: updatedAt earlier than createdAt');
-    const te = meta.tokenEstimate;
-    if (!te || typeof te !== 'object') throw new Error('Metadata invalid: tokenEstimate missing');
-    if (typeof te.min !== 'number' || typeof te.max !== 'number') throw new Error('Metadata invalid: tokenEstimate bounds');
-    if (!['high','medium','low'].includes(te.confidence)) throw new Error('Metadata invalid: confidence');
-  }
-
-  function looksLikeCode(text) {
-    // Heuristic: presence of typical code characters vs length
-    const codeSignals = /[;{}<>]|\b(function|const|let|var|class|def|return|if|for|while)\b/;
-    return codeSignals.test(text);
-  }
-
-  function buildMetadataDisplay(meta) {
-    const wrap = document.createElement('div');
-    wrap.className = 'prompt-meta';
-    if (!meta) { wrap.textContent = 'No metadata'; return wrap; }
-    const row1 = document.createElement('div');
-    row1.className = 'prompt-meta-row';
-    const modelTag = document.createElement('span');
-    modelTag.className = 'prompt-meta-tag';
-    modelTag.innerHTML = `<span class="model-name" title="Model Name">${escapeHtml(meta.model)}</span>`;
-    row1.appendChild(modelTag);
-
-    const tokenEl = document.createElement('span');
-    tokenEl.className = 'token-estimate';
-    tokenEl.dataset.confidence = meta.tokenEstimate?.confidence || 'high';
-    tokenEl.innerHTML = `<span>Tokens:</span><span class="token-range">${meta.tokenEstimate.min}&ndash;${meta.tokenEstimate.max}</span><span>(${meta.tokenEstimate.confidence})</span>`;
-    row1.appendChild(tokenEl);
-
-    const row2 = document.createElement('div');
-    row2.className = 'prompt-meta-row';
-    const created = document.createElement('time');
-    created.dateTime = meta.createdAt;
-    created.title = 'Created';
-    created.textContent = humanTime(meta.createdAt);
-    const updated = document.createElement('time');
-    updated.dateTime = meta.updatedAt;
-    updated.title = 'Updated';
-    updated.textContent = humanTime(meta.updatedAt);
-    row2.appendChild(created);
-    if (meta.updatedAt !== meta.createdAt) {
-      const sep = document.createElement('span'); sep.textContent = '→'; sep.style.opacity = '.5';
-      row2.appendChild(sep);
-      row2.appendChild(updated);
-    }
-    wrap.appendChild(row1);
-    wrap.appendChild(row2);
-    return wrap;
-  }
-
-  function humanTime(iso) {
-    try {
-      const d = new Date(iso);
-      return d.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
-    } catch { return iso; }
-  }
-
-  // Expose for debugging in console
-  window.__promptMeta = { trackModel, updateTimestamps, estimateTokens };
-
-  /* ================= Export / Import System ================= */
-  /** Schema Version for exported file */
-  const EXPORT_SCHEMA_VERSION = 1;
-  /** Names inserted in exported JSON */
-  const EXPORT_FILE_BASENAME = 'prompt-library-export';
-
-  /** Compute statistics from prompts */
-  function computeStats(prompts) {
-    const total = prompts.length;
-    const ratings = prompts.map(p => typeof p.userRating === 'number' ? p.userRating : null).filter(Boolean);
-    const averageRating = ratings.length ? (ratings.reduce((a,b)=>a+b,0) / ratings.length) : null;
-    // most used model
-    const modelCounts = {};
-    for (const p of prompts) {
-      const m = p?.metadata?.model || 'unknown';
-      modelCounts[m] = (modelCounts[m]||0)+1;
-    }
-    let mostUsedModel = null; let max = -1;
-    for (const [m,c] of Object.entries(modelCounts)) { if (c>max) { max=c; mostUsedModel=m; } }
-    return { totalPrompts: total, averageRating, mostUsedModel };
-  }
-
-  /** Validate a single prompt record minimally */
+  // ============================================================================
+  // IMPORT/EXPORT
+  // ============================================================================
+  
   function validatePromptRecord(p) {
-    if (!p || typeof p !== 'object') throw new Error('Prompt not an object');
-    if (typeof p.id !== 'string') throw new Error('Prompt missing id');
+    if (!p || typeof p !== 'object') throw new Error('Invalid prompt object');
+    if (typeof p.id !== 'string' || !p.id) throw new Error('Prompt missing id');
     if (typeof p.title !== 'string') throw new Error('Prompt missing title');
     if (typeof p.content !== 'string') throw new Error('Prompt missing content');
-    if (!p.metadata || typeof p.metadata !== 'object') throw new Error('Prompt missing metadata');
-    try { validateMetadata(p.metadata); } catch (e) { throw new Error('Metadata invalid for prompt '+p.id+': '+e.message); }
   }
 
-  /** Build export JSON object */
   function buildExportPayload() {
     const prompts = loadPrompts();
     const notesStore = loadNotesStore();
-    const stats = computeStats(prompts);
+    
     const payload = {
       type: 'prompt-library-backup',
       schemaVersion: EXPORT_SCHEMA_VERSION,
       exportedAt: new Date().toISOString(),
-      application: 'Prompt Library',
-      meta: {
-        stats,
-        storageKeys: { prompts: STORAGE_KEY, notes: NOTES_KEY },
-        sourceUrl: location.href.split('#')[0]
-      },
       data: { prompts, notes: notesStore }
     };
-    // Final validation of all prompts
+    
     prompts.forEach(validatePromptRecord);
     return payload;
   }
@@ -741,189 +842,209 @@
     a.href = URL.createObjectURL(blob);
     document.body.appendChild(a);
     a.click();
-    setTimeout(()=>{ URL.revokeObjectURL(a.href); a.remove(); }, 1000);
+    setTimeout(() => { 
+      URL.revokeObjectURL(a.href); 
+      a.remove(); 
+    }, 1000);
   }
 
   function exportPrompts() {
     try {
       const payload = buildExportPayload();
       triggerDownload(payload);
-      showIEMessage('Export completed.', 'success');
+      showIEMessage('Export completed!', 'success');
     } catch (e) {
       console.error(e);
-      showIEMessage('Export failed: '+(e.message||e), 'error');
+      showIEMessage('Export failed: ' + (e.message || e), 'error');
     }
   }
 
-  /** Parse and validate imported JSON structure */
   function parseImportFile(text) {
     let data;
-    try { data = JSON.parse(text); } catch (e) { throw new Error('File is not valid JSON.'); }
-    // Accept three shapes:
-    // 1. Current schema: { type:'prompt-library-backup', schemaVersion, data:{prompts,notes} }
-    // 2. Legacy object: { prompts:[...], notes:{...} } (no type/schemaVersion)
-    // 3. Bare array: [ {id,title,content,metadata?}, ... ]
+    try { 
+      data = JSON.parse(text); 
+    } catch (e) { 
+      throw new Error('File is not valid JSON'); 
+    }
+    
     if (Array.isArray(data)) {
-      // Bare array fallback
       const prompts = data.map(hydrateLegacyPrompt);
       prompts.forEach(validatePromptRecord);
-      return { prompts, notes: {}, raw: { legacy: true, origin: 'array' } };
+      return { prompts, notes: {} };
     }
-    if (!data || typeof data !== 'object') throw new Error('Root not an object');
+    
+    if (!data || typeof data !== 'object') {
+      throw new Error('Invalid file format');
+    }
 
     const typeVal = typeof data.type === 'string' ? data.type.toLowerCase() : null;
     const isModern = typeVal === 'prompt-library-backup';
-    const looksLegacyObject = !isModern && (Array.isArray(data.prompts) || Array.isArray(data.data)) && (data.notes || data.prompts || data.data);
-
-    if (!isModern && !looksLegacyObject) {
-      throw new Error('Unsupported file type');
-    }
 
     if (isModern) {
-      if (typeof data.schemaVersion !== 'number') throw new Error('Missing schemaVersion');
-      if (data.schemaVersion > EXPORT_SCHEMA_VERSION) throw new Error('Export file version is newer ('+data.schemaVersion+'), update app.');
       const prompts = data?.data?.prompts;
       const notes = data?.data?.notes || {};
-      if (!Array.isArray(prompts)) throw new Error('data.prompts must be an array');
+      if (!Array.isArray(prompts)) {
+        throw new Error('Invalid prompts data');
+      }
       prompts.forEach(validatePromptRecord);
-      if (typeof notes !== 'object') throw new Error('data.notes must be object');
-      return { prompts, notes, raw: data };
+      return { prompts, notes };
     }
 
-    // Legacy object path
-    const promptsArr = Array.isArray(data.prompts) ? data.prompts : (Array.isArray(data.data) ? data.data : []);
+    const promptsArr = Array.isArray(data.prompts) ? data.prompts : [];
     const legacyNotes = data.notes && typeof data.notes === 'object' ? data.notes : {};
     const prompts = promptsArr.map(hydrateLegacyPrompt);
     prompts.forEach(validatePromptRecord);
-    return { prompts, notes: legacyNotes, raw: { legacy: true, origin: 'object' } };
+    return { prompts, notes: legacyNotes };
   }
 
-  /** Merge strategy ask user: replace or merge (with conflict resolution) */
   function mergePrompts(existing, incoming) {
     const map = new Map(existing.map(p => [p.id, p]));
-    const conflicts = [];
+    
+    // Just merge - no confirmation
     for (const p of incoming) {
-      if (map.has(p.id)) conflicts.push(p.id);
+      map.set(p.id, p);
     }
-    if (conflicts.length) {
-      const strategy = askConflictStrategy(conflicts.length);
-      if (!strategy) throw new Error('Import cancelled by user');
-      if (strategy === 'replace') {
-        // Replace conflicting prompts with incoming versions
-        for (const p of incoming) map.set(p.id, p);
-      } else if (strategy === 'skip') {
-        for (const p of incoming) {
-          if (!map.has(p.id)) map.set(p.id, p);
-        }
-      } else if (strategy === 'keepBoth') {
-        for (const p of incoming) {
-          if (map.has(p.id)) {
-            // generate new id
-            const newId = createId();
-            const clone = { ...p, id: newId };
-            map.set(clone.id, clone);
-          } else {
-            map.set(p.id, p);
-          }
-        }
-      }
-    } else {
-      // simple append
-      for (const p of incoming) map.set(p.id, p);
-    }
-    return Array.from(map.values()).sort((a,b) => new Date(b.metadata?.createdAt||0) - new Date(a.metadata?.createdAt||0));
-  }
-
-  function askConflictStrategy(conflictCount) {
-    // Use confirm dialogs for simplicity; could be replaced with custom modal UI
-    // Order: Replace All -> Skip Duplicates -> Keep Both
-    if (!window.confirm(`${conflictCount} duplicate ID(s) found. Proceed to choose resolution?`)) return null;
-    if (window.confirm('Click OK to REPLACE duplicates with incoming versions. Cancel to choose another option.')) return 'replace';
-    if (window.confirm('Click OK to SKIP incoming duplicates. Cancel to keep both.')) return 'skip';
-    return 'keepBoth';
-  }
-
-  /** Backup existing data before import */
-  function backupCurrentData() {
-    const payload = buildExportPayload();
-    try {
-      localStorage.setItem(STORAGE_KEY + '.backup', JSON.stringify(payload.data.prompts));
-      localStorage.setItem(NOTES_KEY + '.backup', JSON.stringify(payload.data.notes));
-    } catch (e) {
-      console.warn('Failed to persist backup', e);
-    }
-  }
-
-  function rollbackFromBackup() {
-    try {
-      const p = localStorage.getItem(STORAGE_KEY + '.backup');
-      const n = localStorage.getItem(NOTES_KEY + '.backup');
-      if (p) localStorage.setItem(STORAGE_KEY, p);
-      if (n) localStorage.setItem(NOTES_KEY, n);
-    } catch (e) {
-      console.error('Rollback failed', e);
-    }
+    
+    return Array.from(map.values()).sort((a,b) => 
+      new Date(b.metadata?.createdAt || 0) - new Date(a.metadata?.createdAt || 0)
+    );
   }
 
   function importFile(file) {
     if (!file) return;
+    
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        backupCurrentData();
         const { prompts: incomingPrompts, notes: incomingNotes } = parseImportFile(String(reader.result));
         const existingPrompts = loadPrompts();
         const mergedPrompts = mergePrompts(existingPrompts, incomingPrompts);
-        // merge notes: union by promptId then note id (simple strategy)
+        
         const currentNotes = loadNotesStore();
         const finalNotes = { ...currentNotes };
+        
         for (const [pid, arr] of Object.entries(incomingNotes)) {
           if (!Array.isArray(arr)) continue;
           if (!Array.isArray(finalNotes[pid])) finalNotes[pid] = [];
           const noteIds = new Set(finalNotes[pid].map(n => n.id));
-            for (const n of arr) {
-              if (!n || typeof n.id !== 'string') continue;
-              if (noteIds.has(n.id)) continue; // skip duplicates
-              finalNotes[pid].push(n);
-            }
+          for (const n of arr) {
+            if (!n || typeof n.id !== 'string') continue;
+            if (noteIds.has(n.id)) continue;
+            finalNotes[pid].push(n);
+          }
         }
+        
         savePrompts(mergedPrompts);
         saveNotesStore(finalNotes);
-        render(mergedPrompts);
-        showIEMessage(`Import successful. Added ${incomingPrompts.length} prompt(s).`, 'success');
+        applyFiltersAndRender();
+        
+        showIEMessage(`Import successful! Added ${incomingPrompts.length} prompt(s).`, 'success');
       } catch (e) {
         console.error('Import error', e);
-        rollbackFromBackup();
-        render(loadPrompts());
-        showIEMessage('Import failed: '+(e.message||e), 'error');
+        applyFiltersAndRender();
+        showIEMessage('Import failed: ' + (e.message || e), 'error');
       }
     };
+    
     reader.onerror = () => {
-      showIEMessage('Failed reading file.', 'error');
+      showIEMessage('Failed to read file', 'error');
     };
+    
     reader.readAsText(file);
   }
 
   function showIEMessage(msg, type) {
     const host = document.getElementById('import-export-messages');
     if (!host) return;
+    
     host.textContent = msg;
     host.hidden = false;
-    host.className = 'iemessages ' + (type||'');
+    host.className = 'iemessages ' + (type || '');
+    
     clearTimeout(showIEMessage._t);
-    showIEMessage._t = setTimeout(()=>{ host.hidden = true; }, 6000);
+    showIEMessage._t = setTimeout(() => { 
+      host.hidden = true; 
+    }, 5000);
   }
 
   function setupImportExport() {
     const exportBtn = document.getElementById('export-btn');
     const importBtn = document.getElementById('import-btn');
     const fileInput = document.getElementById('import-file');
-    if (exportBtn) exportBtn.addEventListener('click', exportPrompts);
-    if (importBtn) importBtn.addEventListener('click', () => fileInput && fileInput.click());
-    if (fileInput) fileInput.addEventListener('change', (e) => {
-      const f = fileInput.files && fileInput.files[0];
-      if (f) importFile(f);
-      fileInput.value = '';
+    
+    if (exportBtn) {
+      exportBtn.addEventListener('click', exportPrompts);
+    }
+    
+    if (importBtn) {
+      importBtn.addEventListener('click', () => fileInput && fileInput.click());
+    }
+    
+    if (fileInput) {
+      fileInput.addEventListener('change', (e) => {
+        const f = fileInput.files && fileInput.files[0];
+        if (f) importFile(f);
+        fileInput.value = '';
+      });
+    }
+  }
+
+  // ============================================================================
+  // INITIALIZATION
+  // ============================================================================
+  
+  function init() {
+    form.addEventListener('submit', handleFormSubmit);
+    if (cancelEditBtn) cancelEditBtn.addEventListener('click', clearForm);
+    if (clearBtn) clearBtn.addEventListener('click', clearForm);
+    
+    if (searchInput) searchInput.addEventListener('input', debounce(handleSearch, 300));
+    if (clearSearchBtn) clearSearchBtn.addEventListener('click', clearSearch);
+    if (sortSelect) sortSelect.addEventListener('change', handleSortChange);
+    
+    // Event delegation for rating stars
+    if (listEl) {
+      listEl.addEventListener('click', (e) => {
+        const starBtn = e.target.closest('button.star');
+        if (starBtn && starBtn.dataset.value && starBtn.dataset.promptId) {
+          e.preventDefault();
+          e.stopPropagation();
+          const value = Number(starBtn.dataset.value);
+          const promptId = starBtn.dataset.promptId;
+          console.log('Rating star clicked via delegation:', promptId, value);
+          setRating(promptId, value);
+        }
+      });
+      
+      listEl.addEventListener('keydown', (e) => {
+        const starBtn = e.target.closest('button.star');
+        if (starBtn && starBtn.dataset.value && starBtn.dataset.promptId) {
+          handleStarKey(e, starBtn.dataset.promptId);
+        }
+      });
+    }
+    
+    setupImportExport();
+    
+    currentPrompts = loadPrompts();
+    applyFiltersAndRender();
+    
+    document.addEventListener('keydown', (e) => {
+      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+        e.preventDefault();
+        if (searchInput) {
+          searchInput.focus();
+          searchInput.select();
+        }
+      }
     });
+    
+    console.log('✏️ Prompt Library initialized');
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
   }
 })();
